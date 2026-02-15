@@ -1,120 +1,109 @@
-// api/news.js
 export default async function handler(req, res) {
   const { asset, priceChange } = req.query;
   if (!asset) return res.status(400).json({ error: "Asset required" });
 
   const NEWS_API = process.env.NEWS_API_KEY;
   const FINNHUB_API = process.env.FINNHUB_API_KEY;
-  const ALPHA_API = process.env.ALPHA_VANTAGE_KEY;
 
-  // Auto-detect stock vs crypto
-  const cryptoTickers = ["btc","eth","sol","xrp","bnb","uni","atom","ada"];
-  const isCrypto = cryptoTickers.some(c => asset.toLowerCase().includes(c));
-
-  // Build query string
-  const assetName = asset; // Replace with full name from dataset if available
-  const query = isCrypto
-    ? encodeURIComponent(`"${assetName} crypto" OR ${asset}`)
-    : encodeURIComponent(`"${assetName}" OR ${asset}`);
-
-  const newsApiUrl = `https://newsapi.org/v2/everything?q=${query}&language=en&sortBy=publishedAt&pageSize=20&apiKey=${NEWS_API}`;
+  // 1. Better Query Logic
+  const cryptoTickers = ["btc", "eth", "sol", "xrp", "bnb", "doge"];
+  const isCrypto = cryptoTickers.includes(asset.toLowerCase());
+  const searchTerm = isCrypto ? `${asset} crypto` : `${asset} stock market`;
 
   try {
-    // Fetch NewsAPI
-    const newsApiRes = await fetch(newsApiUrl);
-    const newsApiData = await newsApiRes.json();
+    // 2. Parallel Fetching (Faster)
+    const [newsApiRes, finnhubRes] = await Promise.all([
+      fetch(`https://newsapi.org/v2/everything?q=${encodeURIComponent(searchTerm)}&language=en&sortBy=publishedAt&pageSize=30&apiKey=${NEWS_API}`),
+      fetch(`https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_API}`)
+    ]);
+
+    const newsData = await newsApiRes.json();
+    const finnData = await finnhubRes.json();
 
     let articles = [];
 
-    if (newsApiData?.articles) {
-      articles.push(...newsApiData.articles.map(a => ({
+    // Process NewsAPI
+    if (newsData.articles) {
+      articles.push(...newsData.articles.map(a => ({
         title: a.title,
         url: a.url,
         source: a.source.name,
-        publishedAt: a.publishedAt,
-        language: 'en' // NewsAPI already filtered by English
+        time: a.publishedAt,
+        description: a.description || ""
       })));
     }
 
-    // Filter: English only
-    articles = articles.filter(a => !a.language || a.language === 'en');
+    // Process Finnhub (Only if relevant to asset)
+    if (Array.isArray(finnData)) {
+      articles.push(...finnData
+        .filter(a => a.headline.toLowerCase().includes(asset.toLowerCase()))
+        .map(a => ({
+          title: a.headline,
+          url: a.url,
+          source: a.source,
+          time: new Date(a.datetime * 1000).toISOString(),
+          description: a.summary || ""
+        })));
+    }
 
-    // Filter: source whitelist
-    const allowedSources = [
-      "Bloomberg", "Reuters", "CNBC", "Financial Times",
-      "Yahoo Finance", "The Wall Street Journal", "CoinDesk",
-      "Cointelegraph", "CryptoSlate", "Investopedia", "NASDAQ"
-    ];
-    articles = articles.filter(a => allowedSources.includes(a.source));
+    // 3. Robust Filtering (Blacklist instead of Whitelist)
+    const spamDomains = ["github.com", "reddit.com", "youtube.com", "nfts", "substack"];
+    articles = articles.filter(a => 
+      a.title && 
+      !spamDomains.some(d => a.url.includes(d)) &&
+      !a.title.includes("Removed")
+    );
 
-    // Filter: spam / non-news domains
-    const spamDomains = ["github.com","medium.com","reddit.com","substack.com","blogspot.com","youtube.com"];
-    articles = articles.filter(a => !spamDomains.some(domain => a.url.includes(domain)));
-
-    // Deduplicate by title + url
+    // Deduplicate
     const seen = new Set();
     articles = articles.filter(a => {
-      const key = a.title + a.url;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+      const isDuplicate = seen.has(a.url);
+      seen.add(a.url);
+      return !isDuplicate;
     });
 
-    // ------------------------------
-    // 0-100 Beginner-Friendly Sentiment
-    // ------------------------------
-    const positiveWords = ["surge","bullish","beats","growth","profit","upgrade","record","strong","rally"];
-    const negativeWords = ["crash","bearish","lawsuit","drop","miss","downgrade","weak","fall","collapse"];
+    // 4. Sentiment & Scoring
+    const weights = {
+      bullish: ["surge", "bullish", "growth", "profit", "rally", "buy", "breakout", "upgrade", "partnership"],
+      bearish: ["crash", "bearish", "drop", "lawsuit", "weak", "sell", "plunge", "downgrade", "scam", "inflation"]
+    };
 
-    function scoreSentiment(title) {
+    articles = articles.map(a => {
       let score = 0;
-      positiveWords.forEach(w => title.toLowerCase().includes(w) && score++);
-      negativeWords.forEach(w => title.toLowerCase().includes(w) && score--);
-      return score;
-    }
+      const text = (a.title + " " + a.description).toLowerCase();
+      weights.bullish.forEach(w => text.includes(w) && (score += 2));
+      weights.bearish.forEach(w => text.includes(w) && (score -= 2));
+      return { ...a, sentiment: score };
+    });
 
-    articles = articles.map(a => ({ ...a, sentiment: scoreSentiment(a.title) }));
+    const avgSentiment = articles.length > 0 
+      ? articles.reduce((sum, a) => sum + a.sentiment, 0) / articles.length 
+      : 0;
 
-    // Aggregate score 0–100
-    const raw = articles.reduce((s,a)=>s+a.sentiment,0);
-    const maxPossible = articles.length * 2 || 1; // avoid divide by zero
-    let sentimentScore = Math.round(((raw + maxPossible) / (maxPossible * 2)) * 100);
-    sentimentScore = Math.max(0, Math.min(100, sentimentScore));
-
-    // Mood
+    // 5. Prediction Logic
+    const sentimentScore = Math.min(100, Math.max(0, 50 + (avgSentiment * 10)));
     let mood = "Neutral";
-    if (sentimentScore > 60) mood = "Bullish";
-    if (sentimentScore < 40) mood = "Bearish";
+    let prediction = "Stable / Consolidation";
 
-    // Correlate with price movement (optional)
-    let correlation = "No price data given.";
-    if (priceChange) {
-      if (priceChange > 0 && sentimentScore > 50) correlation = "Price went up and news is positive → news likely pushed price up.";
-      if (priceChange < 0 && sentimentScore < 50) correlation = "Price went down and news is negative → bad news likely caused the drop.";
-      if (priceChange > 0 && sentimentScore < 50) correlation = "Price went up even though news is bad → traders ignored the news.";
-      if (priceChange < 0 && sentimentScore > 50) correlation = "Price went down even though news is good → market fear or profit-taking.";
+    if (sentimentScore > 60) {
+      mood = "Bullish";
+      prediction = "Potential Short-term Uptrend";
+    } else if (sentimentScore < 40) {
+      mood = "Bearish";
+      prediction = "Potential Downward Pressure";
     }
-
-    // Beginner-friendly explanation
-    const explanation = (() => {
-      if (mood === "Bullish") return `The news is mostly good. People feel happy and may want to buy this.`;
-      if (mood === "Bearish") return `The news is mostly bad. People feel scared and may want to sell.`;
-      return `The news is mixed. People are unsure what will happen next.`;
-    })();
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(200).json({
       asset,
-      isCrypto,
-      sentimentScore,
       mood,
-      explanation,
-      correlation,
-      count: articles.length,
-      articles
+      sentimentScore: Math.round(sentimentScore),
+      prediction,
+      totalArticles: articles.length,
+      articles: articles.slice(0, 10) // Return top 10 cleanest
     });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to process news", details: err.message });
   }
 }
