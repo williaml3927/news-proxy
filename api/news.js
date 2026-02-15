@@ -2,101 +2,121 @@ export default async function handler(req, res) {
   const { asset } = req.query;
   if (!asset) return res.status(400).json({ error: "Asset symbol required" });
 
-  const keys = {
-    news: process.env.NEWS_API_KEY,
-    finn: process.env.FINNHUB_API_KEY,
-    alpha: process.env.ALPHA_VANTAGE_KEY
-  };
+  const NEWS_API_KEY = process.env.NEWS_API_KEY;
+  const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_KEY;
+  const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+
+  // 1. Strict Domain Whitelist (Only High-Quality Financial News)
+  const trustedDomains = [
+    "reuters.com", "bloomberg.com", "cnbc.com", "wsj.com", "forbes.com",
+    "marketwatch.com", "benzinga.com", "finance.yahoo.com", "investing.com",
+    "coindesk.com", "cointelegraph.com", "barrons.com", "ft.com"
+  ].join(",");
+
+  // 2. Exclusion List (Blocks Code Repos and Spam)
+  const excludeDomains = "github.com,pypi.org,npm.com,medium.com,reddit.com,youtube.com,substack.com";
 
   try {
-    const results = await Promise.allSettled([
-      // 1. Alpha Vantage (Best for Sentiment & Benzinga)
-      fetch(`https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${asset}&limit=10&apikey=${keys.alpha}`).then(res => res.json()),
+    // Parallel Fetching from 3 Top-Tier Sources
+    const [alphaRes, newsApiRes, finnhubRes] = await Promise.all([
+      // Alpha Vantage (Includes Benzinga & Sentiment Scores)
+      fetch(`https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${asset}&limit=10&apikey=${ALPHA_VANTAGE_KEY}`).then(r => r.json()),
       
-      // 2. Finnhub (Company specific)
-      fetch(`https://finnhub.io/api/v1/company-news?symbol=${asset.toUpperCase()}&from=2024-01-01&to=${new Date().toISOString().split('T')[0]}&token=${keys.finn}`).then(res => res.json()),
-      
-      // 3. NewsAPI (The widest net)
-      fetch(`https://newsapi.org/v2/everything?q=${asset}&language=en&sortBy=publishedAt&pageSize=10&apiKey=${keys.news}`).then(res => res.json())
+      // NewsAPI (Restricted to Trusted Domains + English)
+      fetch(`https://newsapi.org/v2/everything?q=${asset}&domains=${trustedDomains}&excludeDomains=${excludeDomains}&language=en&sortBy=relevancy&pageSize=15&apiKey=${NEWS_API_KEY}`).then(r => r.json()),
+
+      // Finnhub (Direct Ticker News)
+      fetch(`https://finnhub.io/api/v1/company-news?symbol=${asset.toUpperCase()}&from=${new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]}&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_API_KEY}`).then(r => r.json())
     ]);
 
-    let articles = [];
+    let rawArticles = [];
 
     // Parse Alpha Vantage
-    if (results[0].status === 'fulfilled' && results[0].value.feed) {
-      articles.push(...results[0].value.feed.map(a => ({
+    if (alphaRes.feed) {
+      rawArticles.push(...alphaRes.feed.map(a => ({
         title: a.title,
         url: a.url,
         source: a.source,
-        date: a.time_published,
+        date: new Date(a.time_published.replace(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3T$4:$5:$6')).toLocaleDateString(),
         summary: a.summary,
-        sentiment: Math.round((parseFloat(a.overall_sentiment_score) + 1) * 50)
-      })));
-    }
-
-    // Parse Finnhub
-    if (results[1].status === 'fulfilled' && Array.isArray(results[1].value)) {
-      articles.push(...results[1].value.map(a => ({
-        title: a.headline,
-        url: a.url,
-        source: a.source,
-        date: new Date(a.datetime * 1000).toISOString(),
-        summary: a.summary,
-        sentiment: 50
+        sentiment: parseFloat(a.overall_sentiment_score || 0)
       })));
     }
 
     // Parse NewsAPI
-    if (results[2].status === 'fulfilled' && results[2].value.articles) {
-      articles.push(...results[2].value.articles.map(a => ({
+    if (newsApiRes.articles) {
+      rawArticles.push(...newsApiRes.articles.map(a => ({
         title: a.title,
         url: a.url,
         source: a.source.name,
-        date: a.publishedAt,
+        date: new Date(a.publishedAt).toLocaleDateString(),
         summary: a.description,
-        sentiment: 50
+        sentiment: 0 // Will calculate manually below
       })));
     }
 
-    // --- THE FIX: SMART FILTERING ---
-    // 1. Remove obvious junk
-    articles = articles.filter(a => a.title && !a.title.includes("[Removed]"));
+    // Parse Finnhub
+    if (Array.isArray(finnhubRes)) {
+      rawArticles.push(...finnhubRes.map(a => ({
+        title: a.headline,
+        url: a.url,
+        source: a.source,
+        date: new Date(a.datetime * 1000).toLocaleDateString(),
+        summary: a.summary,
+        sentiment: 0
+      })));
+    }
 
-    // 2. Remove Duplicates
-    const seen = new Set();
-    articles = articles.filter(a => {
-      const isDup = seen.has(a.url);
-      seen.add(a.url);
-      return !isDup;
-    });
+    // --- RELEVANCE & QUALITY FILTERING ---
+    const cleanArticles = [];
+    const seenUrls = new Set();
 
-    // 3. FALLBACK LOGIC: If we have NO news mentioning the asset, 
-    // we keep the general results so the user isn't looking at a blank screen.
-    const relevantArticles = articles.filter(a => 
-      (a.title + a.summary).toLowerCase().includes(asset.toLowerCase())
-    );
+    for (const art of rawArticles) {
+      const lowerTitle = art.title?.toLowerCase() || "";
+      const lowerSummary = art.summary?.toLowerCase() || "";
+      const search = asset.toLowerCase();
 
-    const finalSelection = relevantArticles.length > 0 ? relevantArticles : articles;
-    const top6 = finalSelection.slice(0, 6);
+      // Check if Asset is actually mentioned in Title or Summary
+      if (!lowerTitle.includes(search) && !lowerSummary.includes(search)) continue;
+      
+      // Remove Duplicates
+      if (seenUrls.has(art.url)) continue;
+      seenUrls.add(art.url);
 
-    // AI Summary & Sentiment
-    const avgSentiment = top6.length > 0 
-      ? Math.round(top6.reduce((s, a) => s + a.sentiment, 0) / top6.length) 
-      : 50;
-    
-    const summary = top6.length > 0 
-      ? `The latest outlook for ${asset.toUpperCase()} shows ${avgSentiment > 50 ? 'positive' : 'cautious'} momentum. Top reports from ${top6[0].source} discuss: ${top6[0].title}.`
-      : "No news found for this specific ticker. Market activity might be low.";
+      // Simple keyword sentiment if Alpha Vantage didn't provide one
+      if (art.sentiment === 0) {
+        const bull = ["surge", "rally", "growth", "buy", "upgraded", "profit", "bullish"];
+        const bear = ["plunge", "fall", "crash", "sell", "downgraded", "loss", "bearish"];
+        bull.forEach(w => lowerTitle.includes(w) && (art.sentiment += 0.2));
+        bear.forEach(w => lowerTitle.includes(w) && (art.sentiment -= 0.2));
+      }
+
+      cleanArticles.push(art);
+    }
+
+    // Sort by Date & Quality, then pick Top 6
+    const top6 = cleanArticles
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, 6);
+
+    // Calculate Overall 0-100 Score
+    const avgSentiment = top6.reduce((acc, a) => acc + a.sentiment, 0) / (top6.length || 1);
+    const normalizedScore = Math.round((avgSentiment + 1) * 50); // Convert -1 to 1 range to 0-100
+
+    // Final "Market Pulse" Summary
+    const mood = normalizedScore > 60 ? "Bullish" : normalizedScore < 40 ? "Bearish" : "Neutral";
+    const overview = `Currently ${mood} sentiment for ${asset.toUpperCase()}. Top stories from ${top6[0]?.source || 'major sources'} highlight key market drivers. Average sentiment score is ${normalizedScore}/100.`;
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(200).json({
       asset: asset.toUpperCase(),
-      sentimentScore: avgSentiment,
-      summary: summary,
+      overallSentiment: normalizedScore,
+      mood: mood,
+      summary: overview,
       articles: top6
     });
 
   } catch (err) {
-    res.status(500).json({ error: "Server Error", details: err.message });
+    res.status(500).json({ error: "Service Error", details: err.message });
   }
 }
