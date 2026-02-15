@@ -1,91 +1,137 @@
 // api/news.js
 export default async function handler(req, res) {
-  const { asset } = req.query; // Expecting ticker like "AAPL" or "BTC"
-  if (!asset) return res.status(400).json({ error: "Ticker symbol required" });
+  const { asset } = req.query;
+  if (!asset) return res.status(400).json({ error: "Asset required" });
 
-  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
-  const ALPHA_KEY = process.env.ALPHA_VANTAGE_KEY;
+  const FINNHUB = process.env.FINNHUB_API_KEY;
+  const ALPHA = process.env.ALPHA_VANTAGE_KEY;
 
-  // 1. Detect if Asset is Crypto or Stock
-  const cryptoList = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE"];
-  const isCrypto = cryptoList.includes(asset.toUpperCase());
+  const ticker = asset.toUpperCase();
 
   try {
-    // 2. Parallel Fetch from Professional Sources
-    const [finnRes, alphaRes] = await Promise.allSettled([
-      // Source A: Finnhub (Ticker-specific company news)
-      fetch(isCrypto 
-        ? `https://finnhub.io/api/v1/news?category=crypto&token=${FINNHUB_KEY}`
-        : `https://finnhub.io/api/v1/company-news?symbol=${asset.toUpperCase()}&from=${new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0]}&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_KEY}`
-      ).then(res => res.json()),
+    // ------------------------------
+    // FETCH FINNHUB NEWS
+    // ------------------------------
+    const finnUrl = `https://finnhub.io/api/v1/company-news?symbol=${ticker}&from=2025-02-01&to=2026-02-15&token=${FINNHUB}`;
+    const finnRes = await fetch(finnUrl);
+    const finnData = await finnRes.json();
 
-      // Source B: Alpha Vantage (Advanced Market Sentiment)
-      fetch(`https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${asset}&limit=10&apikey=${ALPHA_KEY}`).then(res => res.json())
-    ]);
+    // ------------------------------
+    // FETCH ALPHA VANTAGE NEWS
+    // ------------------------------
+    const alphaUrl = `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${ticker}&limit=50&apikey=${ALPHA}`;
+    const alphaRes = await fetch(alphaUrl);
+    const alphaData = await alphaRes.json();
 
     let articles = [];
 
-    // 3. Process Alpha Vantage (High Quality + Sentiment)
-    if (alphaRes.status === 'fulfilled' && alphaRes.value.feed) {
-      articles.push(...alphaRes.value.feed.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source,
-        date: a.time_published.replace(/^(\d{4})(\d{2})(\d{2}).*/, '$2/$3/$1'),
-        summary: a.summary,
-        // Map Alpha Vantage (-0.35 to 0.35) to 0-100
-        score: Math.round((parseFloat(a.overall_sentiment_score) + 0.5) * 100)
-      })));
-    }
-
-    // 4. Process Finnhub (Institutional Speed)
-    if (finnRes.status === 'fulfilled' && Array.isArray(finnRes.value)) {
-      // Filter crypto news to only match the specific coin
-      const data = isCrypto 
-        ? finnRes.value.filter(a => a.headline.toLowerCase().includes(asset.toLowerCase()))
-        : finnRes.value;
-
-      articles.push(...data.map(a => ({
+    // Finnhub format
+    if (Array.isArray(finnData)) {
+      articles.push(...finnData.map(a => ({
         title: a.headline,
         url: a.url,
+        date: new Date(a.datetime * 1000).toISOString(),
         source: a.source,
-        date: new Date(a.datetime * 1000).toLocaleDateString(),
-        summary: a.summary || "Summary available at source.",
-        score: 50 // Finnhub free doesn't provide score; we'll treat as neutral
+        summary: a.summary
       })));
     }
 
-    // 5. Cleanup: Remove Duplicates & Relevance Check
+    // Alpha format
+    if (alphaData.feed) {
+      articles.push(...alphaData.feed.map(a => ({
+        title: a.title,
+        url: a.url,
+        date: a.time_published,
+        source: a.source,
+        summary: a.summary
+      })));
+    }
+
+    // ------------------------------
+    // FILTER SPAM + NON NEWS
+    // ------------------------------
+    const spamDomains = ["github.com","reddit.com","medium.com","youtube.com","substack.com","blogspot.com"];
+    articles = articles.filter(a => !spamDomains.some(d => a.url.includes(d)));
+
+    // ------------------------------
+    // FILTER HIGH QUALITY SOURCES
+    // ------------------------------
+    const goodSources = ["Bloomberg","Reuters","CNBC","Yahoo Finance","Financial Times","WSJ","CoinDesk","Cointelegraph"];
+    articles = articles.filter(a => goodSources.some(s => a.source?.includes(s)));
+
+    // ------------------------------
+    // FILTER RELEVANT CONTENT
+    // ------------------------------
+    const keywords = ["earnings","revenue","profit","forecast","guidance","price","market","growth","decline","lawsuit","regulation"];
+    articles = articles.filter(a =>
+      keywords.some(k => (a.title + a.summary).toLowerCase().includes(k))
+    );
+
+    // ------------------------------
+    // REMOVE DUPLICATES
+    // ------------------------------
     const seen = new Set();
-    const cleanArticles = articles
-      .filter(a => {
-        const isDuplicate = seen.has(a.url);
-        seen.add(a.url);
-        const mentionsAsset = a.title.toLowerCase().includes(asset.toLowerCase()) || 
-                             a.summary.toLowerCase().includes(asset.toLowerCase());
-        return !isDuplicate && mentionsAsset;
-      })
-      .sort((a, b) => new Date(b.date) - new Date(a.date))
-      .slice(0, 6);
+    articles = articles.filter(a => {
+      const key = a.title + a.url;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 
-    // 6. Final Market Analysis
-    const avgScore = cleanArticles.length > 0 
-      ? Math.round(cleanArticles.reduce((s, a) => s + a.score, 0) / cleanArticles.length) 
-      : 50;
-    
-    let prediction = "Consolidation / Neutral";
-    if (avgScore > 65) prediction = "Bullish / Potential Growth";
-    if (avgScore < 35) prediction = "Bearish / Downward Pressure";
+    // Sort newest first
+    articles.sort((a,b) => new Date(b.date) - new Date(a.date));
 
+    // Keep only 6
+    articles = articles.slice(0,6);
+
+    // ------------------------------
+    // SIMPLE SENTIMENT SCORING 0–100
+    // ------------------------------
+    const positive = ["beats","growth","strong","bullish","record","upgrade","profit"];
+    const negative = ["miss","lawsuit","crash","weak","decline","downgrade","loss"];
+
+    function score(text) {
+      let s = 0;
+      positive.forEach(w => text.toLowerCase().includes(w) && s++);
+      negative.forEach(w => text.toLowerCase().includes(w) && s--);
+      return s;
+    }
+
+    let total = 0;
+    articles = articles.map(a => {
+      const s = score(a.title + " " + a.summary);
+      total += s;
+      return { ...a, sentiment: s };
+    });
+
+    const max = articles.length * 2 || 1;
+    let sentimentScore = Math.round(((total + max) / (max * 2)) * 100);
+    sentimentScore = Math.max(0, Math.min(100, sentimentScore));
+
+    let mood = "Neutral";
+    if (sentimentScore > 60) mood = "Bullish";
+    if (sentimentScore < 40) mood = "Bearish";
+
+    // ------------------------------
+    // BEGINNER SUMMARY
+    // ------------------------------
+    const summary =
+      mood === "Bullish"
+        ? "Most news is positive. The company or crypto is growing and investors feel confident."
+        : mood === "Bearish"
+        ? "Most news is negative. The company or crypto is struggling and investors feel worried."
+        : "News is mixed. Investors are unsure what will happen next.";
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
     res.status(200).json({
-      asset: asset.toUpperCase(),
-      sentimentScore: avgScore,
-      prediction: prediction,
-      summary: `Based on the latest reports from ${cleanArticles[0]?.source || "financial analysts"}, the outlook for ${asset} is ${prediction.split(' ')[0]}.`,
-      articles: cleanArticles
+      ticker,
+      sentimentScore,
+      mood,
+      summary,
+      articles
     });
 
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch professional news." });
+    res.status(500).json({ error: err.message });
   }
 }
