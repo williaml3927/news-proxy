@@ -1,72 +1,106 @@
+// api/news.js
+
 export default async function handler(req, res) {
-  const { asset } = req.query; 
-  if (!asset) return res.status(400).json({ error: "Asset is required" });
+  const asset = req.query.asset?.toUpperCase();
+  if (!asset) return res.status(400).json({ error: "Missing asset" });
 
-  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+  const FINNHUB_KEY = process.env.FINNHUB_KEY;
+  const ALPHA_KEY = process.env.ALPHA_KEY;
 
-  // 1. Fix the Date Formatting (Must be YYYY-MM-DD)
-  const dateObj = new Date();
-  const today = dateObj.toISOString().split('T')[0];
-  dateObj.setMonth(dateObj.getMonth() - 1); // Go back 30 days
-  const lastMonth = dateObj.toISOString().split('T')[0];
+  // Basic crypto detection
+  const cryptoList = ["BTC", "ETH", "SOL", "BNB", "MATIC", "ADA", "UNI", "XRP", "DOGE", "AVAX", "ATOM"];
+  const isCrypto = cryptoList.includes(asset);
 
-  // 2. Determine Endpoint (Stock vs. Crypto)
-  const symbol = asset.toUpperCase();
-  const cryptoCheck = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "DOT"];
-  const isCrypto = cryptoCheck.includes(symbol) || asset.toLowerCase().includes("bitcoin");
+  // Date range for Finnhub stocks
+  const today = new Date().toISOString().split("T")[0];
+  const lastMonth = new Date(Date.now() - 1000 * 60 * 60 * 24 * 30).toISOString().split("T")[0];
 
-  // This is the fix for the line you pointed out:
-  const url = isCrypto 
-    ? `https://finnhub.io/api/v1/news?category=crypto&token=${FINNHUB_KEY}`
-    : `https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${lastMonth}&to=${today}&token=${FINNHUB_KEY}`;
+  let articles = [];
 
   try {
-    const response = await fetch(url);
-    const rawData = await response.json();
+    // ================= FINNHUB (STOCKS) =================
+    if (!isCrypto) {
+      const finnUrl = `https://finnhub.io/api/v1/company-news?symbol=${asset}&from=${lastMonth}&to=${today}&token=${FINNHUB_KEY}`;
+      const finnRes = await fetch(finnUrl);
+      const finnData = await finnRes.json();
 
-    // 3. Simple relevant-only filter
-    let processed = Array.isArray(rawData) ? rawData : [];
-    
-    // If crypto, we have to find our specific coin in the general crypto feed
-    if (isCrypto) {
-      processed = processed.filter(art => 
-        art.headline.toLowerCase().includes(asset.toLowerCase()) || 
-        art.summary.toLowerCase().includes(asset.toLowerCase())
-      );
+      if (Array.isArray(finnData)) {
+        articles = finnData.map(a => ({
+          title: a.headline,
+          url: a.url,
+          source: a.source,
+          publishedAt: new Date(a.datetime * 1000).toISOString(),
+        }));
+      }
     }
 
-    // 4. Map to the 6 high-quality articles you requested
-    const finalNews = processed.slice(0, 6).map(art => {
-      // Basic Sentiment Math
-      const text = (art.headline + art.summary).toLowerCase();
-      let score = 50;
-      if (text.match(/surge|growth|bull|up|high|gain/)) score += 20;
-      if (text.match(/drop|fall|bear|down|low|loss/)) score -= 20;
+    // ================= ALPHA VANTAGE (CRYPTO + BACKUP) =================
+    const alphaUrl = `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${asset}&apikey=${ALPHA_KEY}`;
+    const alphaRes = await fetch(alphaUrl);
+    const alphaData = await alphaRes.json();
 
-      return {
-        title: art.headline,
-        summary: art.summary,
-        url: art.url,
-        source: art.source,
-        date: new Date(art.datetime * 1000).toLocaleDateString(),
-        sentiment: score
-      };
+    if (alphaData.feed) {
+      const alphaArticles = alphaData.feed.map(a => ({
+        title: a.title,
+        url: a.url,
+        source: a.source,
+        publishedAt: a.time_published,
+      }));
+      articles = articles.concat(alphaArticles);
+    }
+
+    // ================= CLEAN + FILTER =================
+
+    // Remove duplicates by URL
+    const unique = [];
+    const seen = new Set();
+    for (const a of articles) {
+      if (a.url && !seen.has(a.url)) {
+        seen.add(a.url);
+        unique.push(a);
+      }
+    }
+
+    // English only (simple filter)
+    const english = unique.filter(a => {
+      return a.title && /^[A-Za-z0-9\s.,'"!?-]+$/.test(a.title);
     });
 
-    // 5. Calculate Overall Sentiment and Future Outlook
-    const avgSentiment = finalNews.length > 0 
-      ? Math.round(finalNews.reduce((acc, a) => acc + a.sentiment, 0) / finalNews.length) 
-      : 50;
+    // Limit to 6 latest
+    const finalNews = english
+      .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))
+      .slice(0, 6);
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // ================= SIMPLE SENTIMENT SCORE =================
+    let score = 50; // neutral baseline
+    const positiveWords = ["growth", "beat", "strong", "bull", "surge", "profit", "adoption"];
+    const negativeWords = ["crash", "decline", "drop", "lawsuit", "bear", "weak", "hack"];
+
+    finalNews.forEach(n => {
+      const text = n.title.toLowerCase();
+      positiveWords.forEach(w => { if (text.includes(w)) score += 5; });
+      negativeWords.forEach(w => { if (text.includes(w)) score -= 5; });
+    });
+
+    score = Math.max(0, Math.min(100, score));
+
+    // Simple explanation for beginners
+    let explanation = "News is neutral.";
+    if (score > 65) explanation = "Most news is positive. Investors feel optimistic.";
+    if (score < 35) explanation = "Most news is negative. Investors feel worried.";
+
+    // CORS
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
     res.status(200).json({
-      asset: symbol,
-      overallSentiment: avgSentiment,
-      summary: finalNews.length > 0 ? `The outlook for ${symbol} is currently ${avgSentiment > 50 ? 'Positive' : 'Cautious'}.` : "No recent news found.",
-      articles: finalNews
+      asset,
+      isCrypto,
+      sentimentScore: score,
+      sentimentExplanation: explanation,
+      articles: finalNews,
     });
 
-  } catch (error) {
-    res.status(500).json({ error: "Finnhub fetch failed" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 }
