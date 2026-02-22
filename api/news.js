@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   const { asset } = req.query; // e.g., "AAPL" or "Bitcoin"
   const FINNHUB_KEY = process.env.FINNHUB_API_KEY; 
   
-  const finnhubUrl = `https://finnhub.io/api/v1/company-news?symbol=${asset}&from=${lastWeek}&to=${today}&token=${FINNHUB_KEY}`;
+  const finnhubUrl = `https://finnhub.io/api/v1/news?category=general&token=${FINNHUB_KEY}`;
 
   try {
     const response = await fetch(url);
