@@ -1,106 +1,39 @@
 // api/news.js
-
 export default async function handler(req, res) {
-  const asset = req.query.asset?.toUpperCase();
-  if (!asset) return res.status(400).json({ error: "Missing asset" });
+  const { asset } = req.query; // Now expects just the ticker (e.g., "AAPL")
+  const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
-  const FINNHUB_KEY = process.env.FINNHUB_KEY;
-  const ALPHA_KEY = process.env.ALPHA_KEY;
+  if (!asset) return res.status(400).json({ error: "Ticker required" });
 
-  // Basic crypto detection
-  const cryptoList = ["BTC", "ETH", "SOL", "BNB", "MATIC", "ADA", "UNI", "XRP", "DOGE", "AVAX", "ATOM"];
-  const isCrypto = cryptoList.includes(asset);
+  const symbol = asset.toUpperCase();
+  const today = new Date().toISOString().split('T')[0];
+  const lastWeek = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
 
-  // Date range for Finnhub stocks
-  const today = new Date().toISOString().split("T")[0];
-  const lastMonth = new Date(Date.now() - 1000 * 60 * 60 * 24 * 30).toISOString().split("T")[0];
-
-  let articles = [];
+  // Logic: Only use the specialized Finnhub 'company-news' endpoint
+  // It is the most reliable for professional stock news.
+  const url = `https://finnhub.io/api/v1/company-news?symbol=${symbol}&from=${lastWeek}&to=${today}&token=${FINNHUB_KEY}`;
 
   try {
-    // ================= FINNHUB (STOCKS) =================
-    if (!isCrypto) {
-      const finnUrl = `https://finnhub.io/api/v1/company-news?symbol=${asset}&from=${lastMonth}&to=${today}&token=${FINNHUB_KEY}`;
-      const finnRes = await fetch(finnUrl);
-      const finnData = await finnRes.json();
+    const response = await fetch(url);
+    const data = await response.json();
 
-      if (Array.isArray(finnData)) {
-        articles = finnData.map(a => ({
-          title: a.headline,
-          url: a.url,
-          source: a.source,
-          publishedAt: new Date(a.datetime * 1000).toISOString(),
-        }));
-      }
+    // Map Finnhub data to the format your Prompt expects
+    const articles = Array.isArray(data) ? data.slice(0, 6).map(art => ({
+      title: art.headline,
+      source: art.source,
+      publishedAt: new Date(art.datetime * 1000).toISOString(),
+      url: art.url
+    })) : [];
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    // If we found nothing, let the frontend know so it triggers the failsafe
+    if (articles.length === 0) {
+      return res.status(200).json({ articles: [], message: "No recent verified news found." });
     }
 
-    // ================= ALPHA VANTAGE (CRYPTO + BACKUP) =================
-    const alphaUrl = `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${asset}&apikey=${ALPHA_KEY}`;
-    const alphaRes = await fetch(alphaUrl);
-    const alphaData = await alphaRes.json();
-
-    if (alphaData.feed) {
-      const alphaArticles = alphaData.feed.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source,
-        publishedAt: a.time_published,
-      }));
-      articles = articles.concat(alphaArticles);
-    }
-
-    // ================= CLEAN + FILTER =================
-
-    // Remove duplicates by URL
-    const unique = [];
-    const seen = new Set();
-    for (const a of articles) {
-      if (a.url && !seen.has(a.url)) {
-        seen.add(a.url);
-        unique.push(a);
-      }
-    }
-
-    // English only (simple filter)
-    const english = unique.filter(a => {
-      return a.title && /^[A-Za-z0-9\s.,'"!?-]+$/.test(a.title);
-    });
-
-    // Limit to 6 latest
-    const finalNews = english
-      .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))
-      .slice(0, 6);
-
-    // ================= SIMPLE SENTIMENT SCORE =================
-    let score = 50; // neutral baseline
-    const positiveWords = ["growth", "beat", "strong", "bull", "surge", "profit", "adoption"];
-    const negativeWords = ["crash", "decline", "drop", "lawsuit", "bear", "weak", "hack"];
-
-    finalNews.forEach(n => {
-      const text = n.title.toLowerCase();
-      positiveWords.forEach(w => { if (text.includes(w)) score += 5; });
-      negativeWords.forEach(w => { if (text.includes(w)) score -= 5; });
-    });
-
-    score = Math.max(0, Math.min(100, score));
-
-    // Simple explanation for beginners
-    let explanation = "News is neutral.";
-    if (score > 65) explanation = "Most news is positive. Investors feel optimistic.";
-    if (score < 35) explanation = "Most news is negative. Investors feel worried.";
-
-    // CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-
-    res.status(200).json({
-      asset,
-      isCrypto,
-      sentimentScore: score,
-      sentimentExplanation: explanation,
-      articles: finalNews,
-    });
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(200).json({ articles });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch news" });
   }
 }
